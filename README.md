@@ -1,5 +1,7 @@
 # HipHap (previously Diplinator)
 
+<img width="300" height="200" alt="hiphap logo" src="https://github.com/user-attachments/assets/794d2471-cdc8-46cb-b63a-f1c11fb5d51e" /> 
+
 Diploid genome assemblies are now routinely available, but most read aligners were designed for haploid references. When reads are aligned to a diploid assembly, the aligner sees two nearly identical alignments to either haplotype, and thus reduces the mapping quality (MapQ) score to reflect this ambiguity. This can cause downstream tools to discard reads from easily mappable regions.
 HipHap resolves this issue by aligning reads to each haplotype assembly separately and assigning each read to its best-supported haplotype. We also introduce a haplotype assignment quality score (HapQ) in HipHap to quantify confidence in the haplotype of origin of a read.
 
@@ -354,8 +356,6 @@ Special cases:
 - Read tied between assemblies (winner = `Both`): HapQ = 0.
 - Read unmapped in both assemblies: no `hq` tag is written.
 - A non-tied read whose score rounds below 1 is reported as HapQ = 1, not 0, so that `hq:i:0` means a true tie and nothing else. HapQ = 0 is therefore never the result of rounding.
-
-Note that HapQ **saturates**: the formula reaches 60 once the winning haplotype leads by about ten matching bases ($d \approx 10$, since $6.02 \times 10 \approx 60$). `hq:i:60` therefore means "at least this much margin", not a margin of 60 — a read leading by 10 bases and one leading by 500 both report 60. Accuracy at `hq:i:60` should be measured empirically rather than read as a Phred probability.
 
 If `--no-hapq` is set, HAPQ is not computed and no `hq:i:` tag is added (recommended when the two inputs are not haplotypes of the same sample, e.g. GRCh38 vs CHM13).
 

@@ -25,12 +25,11 @@ pub fn estimate_minimap2_a(bam_path: &str, reference: Option<&str>, threads: usi
     let mut reader = bam::Reader::from_path(bam_path)
         .map_err(|e| format!("Failed to open '{}' for -A estimation: {}. Set -A/--match_sc explicitly.", bam_path, e))?;
 
-    //the two estimation passes run one after another before any other reader or writer exists,
-    //so this decoder can use the whole budget rather than a hardcoded share of it
+    //runs before full file passes 
     reader.set_threads(max(1, threads))
         .map_err(|e| format!("Failed to set threads for -A estimation on '{}': {}", bam_path, e))?;
 
-    //if reference provided (CRAM), apply it
+    //if reference provided (CRAM), apply
     if let Some(refpath) = reference {
         reader.set_reference(refpath)
             .map_err(|e| format!("Failed to set reference for -A estimation on '{}': {}. Set -A/--match_sc explicitly.", bam_path, e))?;
@@ -104,7 +103,19 @@ fn get_format_from_path<P: AsRef<Path>>(path: P) -> Result<bam::Format, Box<dyn 
             htslib::htsExactFormat_bam => Ok(bam::Format::Bam),
             htslib::htsExactFormat_cram => Ok(bam::Format::Cram),
             htslib::htsExactFormat_sam => Ok(bam::Format::Sam),
-            _ => Err(format!("Unsupported or unknown file format for: {}", path_str).into()),
+            _ => {
+                //a PAF handed in without --paf flag is the common mistake (at least for the author)
+                let name = path_str.to_ascii_lowercase();
+                let name = name.strip_suffix(".gz").or_else(|| name.strip_suffix(".bgz")).unwrap_or(&name);
+                if name.ends_with(".paf") {
+                    Err(format!(
+                        "Unsupported or unknown file format for: {} (this looks like a PAF file: rerun with --paf)",
+                        path_str
+                    ).into())
+                } else {
+                    Err(format!("Unsupported or unknown file format for: {}", path_str).into())
+                }
+            }
         }
     }
 
@@ -147,7 +158,7 @@ pub fn process_sam(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let asm1_names = asm1_hdr.target_names();
     let asm2_names = asm2_hdr.target_names();
 
-    //number of @SQ entries in asm1; in a merged header asm2's contigs are appended after these,
+    //number of @SQ entries in asm1
     let n1 = asm1_hdr.target_count() as i32;
     //offset applied to asm2 reference ids when writing (n1 when merging, 0 with -p)
     let asm2_offset = if args.partition { 0 } else { n1 };
@@ -193,11 +204,11 @@ pub fn process_sam(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    //resolve every output path up front (shared with the PAF backend)
+    //assign all output paths
     let (primary_path, secondary_path, span_path) =
         crate::output_paths(args, extension, ".fastq");
 
-    //create output writers
+    //create output sam writers
     let (mut out_asm1, mut out_asm2): (Writer, Option<Writer>) = match &secondary_path {
         //merged: out_asm1 is the single merged writer and out_asm2 is None
         None => {
@@ -230,7 +241,7 @@ pub fn process_sam(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         asm2_reader.set_reference(r2)
             .map_err(|e| format!("Failed to set reference for asm2 Reader: {}", e))?;
 
-        //set to diploid reference writer when merging (validated above, so unwrap is sound)
+        //set to diploid reference writer when merging
         if !args.partition {
             let rm = args.ref_merged.as_deref().unwrap();
             out_asm1.set_reference(rm)
@@ -264,8 +275,9 @@ pub fn process_sam(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    //open side writer for reads whose winning cluster spans multiple chromosomes (unless disabled)
+    //open side writer for reads whose winning cluster spans multiple chromosomes 
     let mut span_writer: Option<BufWriter<File>> = if args.no_span_chrom {
+        //disanble write with --no-span-chrom
         None
     } else {
         Some(BufWriter::new(File::create(&span_path)
@@ -304,18 +316,19 @@ pub fn process_sam(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut count_asm2: u64 = 0;
     let mut count_equal: u64 = 0;
     let mut count_unmapped: u64 = 0;
+    //reads that also got their losing haplotype's alignments written under --keep-loser
+    let mut count_loser: u64 = 0;
 
-    //initialize summed read lengths (bases) per category
-    //read counts alone can mislead since short reads count the same as long ones
+    //initialize summed read lengths (bps) per category
     let mut bases_asm1: u64 = 0;
     let mut bases_asm2: u64 = 0;
     let mut bases_equal: u64 = 0;
     let mut bases_unmapped: u64 = 0;
 
-    //iterate thorugh both files until they are both fully exhaused
+    //iterate thorugh both files until they are both fully exhausted
     while asm1_iter.peek().is_some() || asm2_iter.peek().is_some() {
 
-        //move forward by one read for both files
+        //move forward by one read's alignments for both files
         get_clusters(&mut asm1_iter, &mut cluster_asm1)?;
         get_clusters(&mut asm2_iter, &mut cluster_asm2)?;
 
@@ -341,11 +354,14 @@ pub fn process_sam(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         //full read length for the base level summary statistics
-        //both clusters are the same read, must check both incase unmapped in one asm
+        //must check both incase read is unmapped in one asm
         let read_bases = cluster_read_len(&cluster_asm1).max(cluster_read_len(&cluster_asm2));
 
-        //get cluster with the higher alignment score, returns the Winner enum and HAPQ
-        let (winner, hapq) = compare_clusters(&mut cluster_asm1, &mut cluster_asm2, args, resolved_match_sc)?;
+        //get cluster with the higher alignment score, returns the Winner enum, HAPQ, and whether
+        //the losing cluster scored close enough to the winner to be worth keeping
+        let (winner, hapq, loser_close) = compare_clusters(&mut cluster_asm1, &mut cluster_asm2, args, resolved_match_sc)?;
+        //goes to out_asm1, the merged writer
+        let keep_loser = args.keep_loser && loser_close;
 
         //logic for which file to write read to given weighted AS comparison output
         match winner {
@@ -354,6 +370,10 @@ pub fn process_sam(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 count_asm1 += 1;
                 bases_asm1 += read_bases;
                 write_winner_cluster(&mut out_asm1, &mut cluster_asm1, hapq, Some(1), 0, &mut span_writer, &asm1_names, "asm1")?;
+                if keep_loser {
+                    count_loser += 1;
+                    write_loser_cluster(&mut out_asm1, &mut cluster_asm2, hapq, asm2_offset)?;
+                }
             }
             //asm2 clear winner, write to the asm2 output (or merged writer with offset)
             crate::Winner::Asm2 => {
@@ -362,38 +382,49 @@ pub fn process_sam(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                  //in merge mode out_asm2 is None: asm2 records go to out_asm1 (the merged writer)
                 let w2: &mut Writer = match out_asm2 { Some(ref mut w) => w, None => &mut out_asm1 };
                 write_winner_cluster(w2, &mut cluster_asm2, hapq, Some(2), asm2_offset, &mut span_writer, &asm2_names, "asm2")?;
+                if keep_loser {
+                    count_loser += 1;
+                    write_loser_cluster(&mut out_asm1, &mut cluster_asm1, hapq, 0)?;
+                }
             }
             crate::Winner::Both => {
                 count_equal += 1;
                 bases_equal += read_bases;
-                //if user specifies --both, write equal scoring reads to both output files
-                //(--both requires -p, so asm2_offset is 0 here; pass it anyway rather than a
-                //hard-coded 0, so this stays correct if the -p requirement is ever relaxed)
+                //if --both true, write equal scoring reads to both output files, only works in partition mode (guarded above)
+
                 if args.both {
                     write_winner_cluster(&mut out_asm1, &mut cluster_asm1, hapq, Some(1), 0, &mut span_writer, &asm1_names, "asm1")?;
                     let w2 = out_asm2.as_mut().expect("internal error: --both requires -p/--partition");
                     write_winner_cluster(w2, &mut cluster_asm2, hapq, Some(2), asm2_offset, &mut span_writer, &asm2_names, "asm2")?;
-                //default behavior is to deterministically randomly assign each tied read to one haplotype
+                
+                //deterministically randomly assign each tied read to one haplotype
                 } else {
                     //hash read name and use last bit value to assign to asm1 or asm2
                     //ensures that assignments will be reproducible
                     match crate::choose_random(cluster_asm1[0].qname()) {
                         crate::Winner::Asm1 => {
                             write_winner_cluster(&mut out_asm1, &mut cluster_asm1, hapq, Some(1), 0, &mut span_writer, &asm1_names, "asm1")?;
+                            //the side the hash did not pick is the loser here
+                            if keep_loser {
+                                count_loser += 1;
+                                write_loser_cluster(&mut out_asm1, &mut cluster_asm2, hapq, asm2_offset)?;
+                            }
                         }
                         _ => {
                             let w2: &mut Writer = match out_asm2 { Some(ref mut w) => w, None => &mut out_asm1 };
                             write_winner_cluster(w2, &mut cluster_asm2, hapq, Some(2), asm2_offset, &mut span_writer, &asm2_names, "asm2")?;
+                            if keep_loser {
+                                count_loser += 1;
+                                write_loser_cluster(&mut out_asm1, &mut cluster_asm1, hapq, 0)?;
+                            }
                         }
                     }
                 }
             }
+             //hapq is None for unmapped reads, so no hq tag is added and no span record is emitted.
             crate::Winner::Unmapped => {
                 count_unmapped += 1;
                 bases_unmapped += read_bases;
-                //hapq is None for unmapped reads, so no hq tag is added and no span record is emitted.
-                //no HP tag either: --unmapped only picks whose records to emit, it is not a
-                //haplotype assignment, so these reads must stay untagged
                 match args.unmapped {
                     crate::cli::UnmappedDest::Asm1 => {
                         write_winner_cluster(&mut out_asm1, &mut cluster_asm1, hapq, None, 0, &mut span_writer, &asm1_names, "asm1")?;
@@ -419,6 +450,10 @@ pub fn process_sam(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         [count_asm1, count_asm2, count_equal, count_unmapped],
         [bases_asm1, bases_asm2, bases_equal, bases_unmapped],
     );
+    //print how many reads cleared --loser-frac
+    if args.keep_loser {
+        crate::print_loser_summary(count_loser, count_asm1 + count_asm2 + count_equal, args.loser_frac);
+    }
 Ok(())
 }
 
@@ -442,12 +477,10 @@ where
     let cur_id = first_record.qname().to_vec();
     //store first record
     cluster.push(first_record);
-
     //look for further lines with same read ID.
     loop {
         //peek at next line
         let peek_result = records.peek();
-
         match peek_result {
             //Next record is valid
             Some(Ok(next_rec)) => {
@@ -470,12 +503,12 @@ where
             None => break,
         }
     }
-    //mutated cluster vector in place, only need to return result Ok
+    //mutated cluster vector in place
     Ok(())
 }
 
 //helper function to get weighted score of reads using a specified tag (AS or ms)
-//for supplental alignments read segments may have overlapping alignments in read coords
+//supplental alignments read segments may have overlapping alignments in read coords
 //want to take average alignment score for every base in the read to determine total score
 fn get_weighted_score(cur_clust : &mut Vec<Record>, tag: &[u8]) -> Result<(f32, u32), Box<dyn std::error::Error>> {
     //get read name
@@ -492,7 +525,7 @@ fn get_weighted_score(cur_clust : &mut Vec<Record>, tag: &[u8]) -> Result<(f32, 
 
     for rec in cur_clust {
         //do not factor secondary alignments into choosing best alignment,
-        // but still output them with the cluster, we don't want to lose them
+        //but still output them with the cluster 
         if rec.is_secondary() {continue};
 
         n_splits += 1;
@@ -541,7 +574,9 @@ fn get_weighted_score(cur_clust : &mut Vec<Record>, tag: &[u8]) -> Result<(f32, 
 }
 
 //choose which alignment block to keep
-fn compare_clusters<'a>(clust1:&'a mut Vec<Record>, clust2:&'a mut Vec<Record>, args:&Cli, match_sc: f32) ->  Result<(crate::Winner, Option<u8>), Box<dyn std::error::Error>> {
+//returns the winner, the HAPQ, and whether the losing cluster is close enough to the winner to
+//be worth writing under --keep-loser
+fn compare_clusters<'a>(clust1:&'a mut Vec<Record>, clust2:&'a mut Vec<Record>, args:&Cli, match_sc: f32) ->  Result<(crate::Winner, Option<u8>, bool), Box<dyn std::error::Error>> {
 
     //if either cluster is empty there is a file sync issue as every cluster should have at least one record
     if clust1.is_empty() || clust2.is_empty() {
@@ -553,11 +588,13 @@ fn compare_clusters<'a>(clust1:&'a mut Vec<Record>, clust2:&'a mut Vec<Record>, 
 
     //handle unmapped read cases
 
+    //the losing side of these cases holds nothing but an unmapped record, so there is never a
+    //losing alignment to keep: the trailing false turns --keep-loser off for all three
     match unmappeds {
-        (true, true) => { return Ok((crate::Winner::Unmapped, None)); }, //unmapped in both
+        (true, true) => { return Ok((crate::Winner::Unmapped, None, false)); }, //unmapped in both
         //if read only maps to one hap then that hap is the winner
-        (true, false) => return Ok((crate::Winner::Asm2, if args.no_hapq { None } else { Some(60u8) })), //  mapped in asm2
-        (false, true) => return Ok((crate::Winner::Asm1, if args.no_hapq { None } else { Some(60u8) })), //  mapped in asm1
+        (true, false) => return Ok((crate::Winner::Asm2, if args.no_hapq { None } else { Some(60u8) }, false)), //  mapped in asm2
+        (false, true) => return Ok((crate::Winner::Asm1, if args.no_hapq { None } else { Some(60u8) }, false)), //  mapped in asm1
         _ => {} //mapped in both continue to check below
     }
 
@@ -573,16 +610,30 @@ fn compare_clusters<'a>(clust1:&'a mut Vec<Record>, clust2:&'a mut Vec<Record>, 
     //both is a special case that can be determined by user input
     if score1 > score2 {
         let hapq = if args.no_hapq { None } else { Some(crate::compute_hapq(score1, score2, n_splits1, match_sc)) };
-        Ok((crate::Winner::Asm1, hapq))
+        Ok((crate::Winner::Asm1, hapq, crate::loser_is_close(score1, score2, args.loser_frac)))
     } else if score1 < score2 {
         let hapq = if args.no_hapq { None } else { Some(crate::compute_hapq(score2, score1, n_splits2, match_sc)) };
-        Ok((crate::Winner::Asm2, hapq))
+        Ok((crate::Winner::Asm2, hapq, crate::loser_is_close(score2, score1, args.loser_frac)))
     } else {
         let hapq = if args.no_hapq { None } else { Some(0u8) };
-        Ok((crate::Winner::Both, hapq))
+        //for a tie keep_loser bool always true
+        Ok((crate::Winner::Both, hapq, true))
     }
 }
 
+//function to get the full read length for a whole cluster of alignments
+//check the CIGAR of the first non-secondary record, which recovers the full length
+//unmapped records have no CIGAR, so fall back to the length of the SEQ field
+fn cluster_read_len(cluster: &[Record]) -> u64 {
+    for rec in cluster.iter() {
+        if !rec.is_secondary() {
+            let rlen = get_read_len(rec);
+            if rlen > 0 { return rlen as u64; }
+            return rec.seq_len() as u64;
+        }
+    }
+    0
+}
 
 //function to get full original read length from CIGAR string
 //sums all query-consuming operations: M/I/=/X/S/H
@@ -598,20 +649,6 @@ fn get_read_len(rec: &Record) -> u32 {
     rlen
 }
 
-//function to get the full read length for a whole cluster of alignments
-//check the CIGAR of the first non-secondary record, which recovers the full length
-//even for hard clipped supplementary records
-//unmapped records have no CIGAR, so fall back to the length of the SEQ field
-fn cluster_read_len(cluster: &[Record]) -> u64 {
-    for rec in cluster.iter() {
-        if !rec.is_secondary() {
-            let rlen = get_read_len(rec);
-            if rlen > 0 { return rlen as u64; }
-            return rec.seq_len() as u64;
-        }
-    }
-    0
-}
 
 //function to get query span of aligned seqment
 fn get_alignment_len(rec: &Record) -> u32  {
@@ -910,8 +947,6 @@ fn write_winner_cluster(writer: &mut Writer, cluster: &mut [Record],hapq: Option
             if !rec.is_supplementary() { primary_idx = Some(i); }
         }
         //add hq (HapQ) and HP (haplotype assignment) tags to record; drop any pre-existing copy
-        //first so re-running hiphap on its own output replaces the tag rather than duplicating it
-        //(remove_aux errors when the tag is absent, which is the normal case)
         if let Some(hq) = hapq {
             let _ = rec.remove_aux(b"hq");
             rec.push_aux(b"hq", Aux::U8(hq))?;
@@ -920,6 +955,8 @@ fn write_winner_cluster(writer: &mut Writer, cluster: &mut [Record],hapq: Option
             let _ = rec.remove_aux(b"HP");
             rec.push_aux(b"HP", Aux::U8(h))?;
         }
+        //a winner never carries hs, so drop any left over from a previous run on this file
+        let _ = rec.remove_aux(b"hs");
         //shift reference ids into the merged header tid coordinates
         if tid_offset != 0 {
             let t = rec.tid();
@@ -936,6 +973,51 @@ fn write_winner_cluster(writer: &mut Writer, cluster: &mut [Record],hapq: Option
             let (seq, qual) = oriented_seq_qual(rec);
             emit_span_fastq(span_writer, rec.qname(), &seq, &qual, &seen_tids, names, label)?;
         }
+    }
+    Ok(())
+}
+
+//write the losing haplotype's alignments to the merged file as secondary records (--keep-loser).
+//only the records that were primary or supplementary in their own cluster are kept
+//the hs tag records what each record was before the secondary flag was set
+//no HP tag: the read was not assigned to this haplotype.
+//no span-chrom handling either
+//claude assisted (checked)
+fn write_loser_cluster(writer: &mut Writer, cluster: &mut [Record], hapq: Option<u8>, tid_offset: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for rec in cluster.iter_mut() {
+        if rec.is_secondary() || rec.is_unmapped() { continue; }
+
+        //remember what this record was, then flag it secondary. set_secondary only ORs in 0x100,
+        //so a supplementary keeps 0x800 and comes out as 0x900
+        let hs = if rec.is_supplementary() { b'S' } else { b'P' };
+        rec.set_secondary();
+
+        //clear SEQ and QUAL: the winning record for this read already holds the read's bases, and
+        //writing them twice would roughly double the merged file. Record::set leaves the aux data
+        //untouched, and an empty seq/qual pair is written out as '*' for both fields
+        let cig = rec.cigar().take();
+        let qname = rec.qname().to_vec();
+        rec.set(&qname, Some(&cig), &[], &[]);
+
+        //same drop-then-push idiom as the winner path, so a re-run replaces rather than duplicates
+        if let Some(hq) = hapq {
+            let _ = rec.remove_aux(b"hq");
+            rec.push_aux(b"hq", Aux::U8(hq))?;
+        }
+        //this record's haplotype lost, so any HP it carried into hiphap must not survive
+        let _ = rec.remove_aux(b"HP");
+        let _ = rec.remove_aux(b"hs");
+        rec.push_aux(b"hs", Aux::Char(hs))?;
+
+        //shift reference ids into the merged header tid coordinates
+        if tid_offset != 0 {
+            let t = rec.tid();
+            if t >= 0 { rec.set_tid(t + tid_offset); }
+            let mt = rec.mtid();
+            if mt >= 0 { rec.set_mtid(mt + tid_offset); }
+        }
+        writer.write(rec)?;
     }
     Ok(())
 }

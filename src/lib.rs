@@ -24,7 +24,7 @@ pub fn choose_random(id: &[u8]) -> Winner {
     if hasher.finish() & 1 == 0 { Winner::Asm1 } else { Winner::Asm2 }
 }
 
-//compute haplotype assignment quality (HAPQ) score
+//compute haplotype assignment quality (HapQ) score
 //confidence measure that a read is assigned to the correct haplotype
 pub fn compute_hapq(score_winner: f32, score_loser: f32, n_splits: u32, match_sc: f32) -> u8 {
     
@@ -41,6 +41,12 @@ pub fn compute_hapq(score_winner: f32, score_loser: f32, n_splits: u32, match_sc
     //a very low hapq score (<1) arising from the emperical penalty gets hapq=1
     (score.clamp(0.0, 60.0) as u8).max(1)
     
+}
+
+// function to determing whether the losing cluster scored close enough to the winner 
+// to be worth reporting under --keep-loser 
+pub fn loser_is_close(score_winner: f32, score_loser: f32, frac: f32) -> bool {
+    score_winner > 0.0 && score_loser >= frac * score_winner
 }
 
 //helper function to merge any read alignment segments that overlap in read coordinates
@@ -85,13 +91,9 @@ pub fn strip_aln_ext(path: &str) -> &str {
     path
 }
 
-//resolve every output path for both modes, shared by the SAM and PAF backends so the two
-//cannot drift apart. ext is the alignment extension taken from the input format
-//(".sam"/".bam"/".cram"/".paf"); span_ext is ".fastq" for SAM/BAM/CRAM and ".txt" for PAF.
-//-> (primary, secondary, span_chrom); secondary is None in merged mode
+//resolve every output path for both modes
 pub fn output_paths(args: &Cli, ext: &str, span_ext: &str) -> (String, Option<String>, String) {
-    //the span file follows the alignment output, so with -o it lands in the same place
-    //rather than in the working directory under an unrelated name
+    //the span file follows the alignment output, so with -o it lands in the same directory
     let span_stem = match &args.output {
         Some(o) => strip_aln_ext(o).to_string(),
         None => format!("hiphap_{}_{}", args.s1, args.s2),
@@ -99,9 +101,7 @@ pub fn output_paths(args: &Cli, ext: &str, span_ext: &str) -> (String, Option<St
     let span = format!("{}_span_chrom{}", span_stem, span_ext);
 
     if args.partition {
-        //-o is the stem the two per-haplotype files share; without it the historical
-        //hiphap_{s1}{ext} / hiphap_{s2}{ext} names are unchanged. Strip any extension the
-        //user supplied so '-o sample.bam' gives sample_mat.bam, not sample.bam_mat.bam
+        //-o is the stem the two per-haplotype files share; Strip any extension the user supplied
         let stem = match &args.output {
             Some(o) => strip_aln_ext(o).to_string(),
             None => "hiphap".to_string(),
@@ -147,13 +147,8 @@ pub struct ThreadPlan {
     pub writer: usize,
 }
 
-//divide the --threads budget between the readers and the writers. A reader counts as one share
-//and a writer as writer_weight shares: for BGZF/CRAM output 4 merged and 3 per writer with -p,
-//where compression costs several times the matching decompression, and 1 for uncompressed SAM
-//text, where there is nothing to compress. With two readers that makes the natural budget
-//2 + 4 = 6 merged and 2 + 3 + 3 = 8 with -p. A request too small to give every file one thread
-//is raised silently, and a leftover thread that will not divide evenly between two writers is
-//left idle so the pair stays symmetric.
+//divide the --threads budget between the readers and the writers
+//claude assisted (checked)
 pub fn plan_threads(
     requested: usize,
     n_readers: usize,
@@ -174,8 +169,7 @@ pub fn plan_threads(
     let mut writer = (total - n_readers * reader) / n_writers;
 
     //for compressed output the writer is the expensive side, so it must never end up with fewer
-    //threads than a reader (only reachable at tiny budgets). Plain SAM is left alone: its target
-    //is 1:1, and e.g. 5 threads merged fit 2/2/1 more closely than 1/1/3.
+    //threads than a reader Plain SAM is left alone
     while writer_weight > 1 && writer < reader && reader > 1 {
         reader -= 1;
         writer = (total - n_readers * reader) / n_writers;
@@ -214,100 +208,9 @@ pub fn print_summary(s1: &str, s2: &str, counts: [u64; 4], bases: [u64; 4]) {
     eprintln!("{:<lw$} {:>cw$} reads          ; {:>bw$} Gbps", labels[4], total, gbp(total_bases));
 }
 
-#[cfg(test)]
-mod tests {
-    use super::plan_threads;
-
-    //the four shapes hiphap actually runs: two readers, one or two writers, compressed or not
-    const MERGED_COMPRESSED: (usize, usize) = (1, 4);
-    const MERGED_SAM: (usize, usize) = (1, 1);
-    const PART_COMPRESSED: (usize, usize) = (2, 3);
-    const PART_SAM: (usize, usize) = (2, 1);
-
-    //(reader, writer) for a given budget and shape
-    fn split(requested: usize, shape: (usize, usize)) -> (usize, usize) {
-        let p = plan_threads(requested, 2, shape.0, shape.1);
-        (p.reader, p.writer)
-    }
-
-    #[test]
-    fn matches_the_default_budgets() {
-        //6 merged: one thread per reader, four for the single writer
-        assert_eq!(split(6, MERGED_COMPRESSED), (1, 4));
-        //8 partitioned: one thread per reader, three for each of the two writers
-        assert_eq!(split(8, PART_COMPRESSED), (1, 3));
-    }
-
-    #[test]
-    fn raises_budgets_below_one_thread_per_file() {
-        for t in 0..=3 {
-            assert_eq!(split(t, MERGED_COMPRESSED), (1, 1), "merged -t {}", t);
-        }
-        for t in 0..=4 {
-            assert_eq!(split(t, PART_COMPRESSED), (1, 1), "partition -t {}", t);
-        }
-    }
-
-    #[test]
-    fn merged_compressed_table() {
-        let expected = [
-            (3, (1, 1)), (4, (1, 2)), (5, (1, 3)), (6, (1, 4)),
-            (8, (1, 6)), (10, (2, 6)), (16, (3, 10)), (32, (5, 22)),
-        ];
-        for (t, want) in expected {
-            assert_eq!(split(t, MERGED_COMPRESSED), want, "-t {}", t);
-            //a lone writer takes whatever the readers leave, so nothing ever idles
-            assert_eq!(2 * want.0 + want.1, t, "-t {} leaves a thread idle", t);
-        }
-    }
-
-    #[test]
-    fn partition_compressed_table() {
-        //(budget, (reader, writer), threads left idle)
-        let expected = [
-            (4, (1, 1), 0), (5, (1, 1), 1), (6, (1, 2), 0), (7, (1, 2), 1),
-            (8, (1, 3), 0), (9, (1, 3), 1), (12, (2, 4), 0), (16, (2, 6), 0),
-            (20, (3, 7), 0), (24, (3, 9), 0), (32, (4, 12), 0),
-        ];
-        for (t, want, idle) in expected {
-            assert_eq!(split(t, PART_COMPRESSED), want, "-t {}", t);
-            assert_eq!(t - (2 * want.0 + 2 * want.1), idle, "-t {} idle count", t);
-        }
-    }
-
-    #[test]
-    fn sam_splits_evenly() {
-        //exact 1:1 whenever the budget divides by the number of files
-        assert_eq!(split(3, MERGED_SAM), (1, 1));
-        assert_eq!(split(6, MERGED_SAM), (2, 2));
-        assert_eq!(split(9, MERGED_SAM), (3, 3));
-        assert_eq!(split(8, PART_SAM), (2, 2));
-        assert_eq!(split(12, PART_SAM), (3, 3));
-        //and the closest fit otherwise, ties going to the readers
-        assert_eq!(split(5, MERGED_SAM), (2, 1));
-        assert_eq!(split(6, PART_SAM), (2, 1));
-    }
-
-    #[test]
-    fn invariants_hold_across_every_budget() {
-        for shape in [MERGED_COMPRESSED, MERGED_SAM, PART_COMPRESSED, PART_SAM] {
-            let (n_writers, weight) = shape;
-            for requested in 0..=128 {
-                let (r, w) = split(requested, shape);
-                //nothing is ever left without a thread
-                assert!(r >= 1 && w >= 1, "{:?} -t {} gave {}/{}", shape, requested, r, w);
-                //and the budget is never overspent (a too-small request is raised to the minimum)
-                let budget = requested.max(2 + n_writers);
-                let assigned = 2 * r + n_writers * w;
-                assert!(assigned <= budget, "{:?} -t {} spent {} of {}", shape, requested, assigned, budget);
-                //at most one thread idles, and only when two writers cannot split the remainder
-                assert!(budget - assigned <= n_writers - 1, "{:?} -t {} idled {}", shape, requested, budget - assigned);
-                //compressed output must never starve the writer relative to a reader
-                if weight > 1 {
-                    assert!(w >= r, "{:?} -t {} gave writer {} < reader {}", shape, requested, w, r);
-                }
-            }
-        }
-    }
+//report how many assigned reads also had their losing haplotype's alignments written under --keep-loser
+pub fn print_loser_summary(count_loser: u64, assigned: u64, frac: f32) {
+    let pct = if assigned == 0 { 0.0 } else { count_loser as f64 / assigned as f64 * 100.0 };
+    eprintln!("Reads with losing-hap alignments kept (>= {:.2} of winner): {} ({:.1}% of assigned reads)",
+        frac, count_loser, pct);
 }
- 

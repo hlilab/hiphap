@@ -10,7 +10,7 @@ use crate::cli::Cli;
 
 
 // estimate  the minimap2 `-A` (Match score) parameter from PAF .
-// Samples ~1 in 10,000 mapped reads until 20 reads are sampledd
+// Samples ~1 in 10,000 mapped reads until 20 reads are sampled
 // and returns the ceiling of the maximum ms / alignment_length  value.
 //claude implemented (checked) 
 pub fn estimate_minimap2_a_paf(paf_path: &str) -> Result<i32, Box<dyn std::error::Error>> {
@@ -125,6 +125,39 @@ fn write_paf_cluster(writer: &mut BufWriter<File>, cluster: &[String],hq_suffix:
     Ok(())
 }
 
+//write the losing haplotype's alignments to the merged PAF as secondary records (--keep-loser).
+//only the lines that were primary in their own cluster are kept: an unmapped line or one already
+//marked tp:A:S says nothing about why the call went the way it did.
+//hs is always P here. minimap2 gives every non-secondary chain tp:A:P, including the ones that
+//become supplementary in SAM, so a PAF line carries nothing that separates the two; hs:A:S only
+//ever appears in SAM/BAM/CRAM output.
+//claude assisted (checked) mimics the sam/bam version 
+fn write_loser_paf_cluster(writer: &mut BufWriter<File>, cluster: &[String], hq_suffix: &str) -> Result<(), Box<dyn std::error::Error>> {
+    for rec in cluster.iter() {
+        //field 6 (index 5) is the target name, '*' for an unmapped read
+        if rec.split('\t').nth(5).is_none_or(|t| t == "*") { continue; }
+        //the loser's own secondaries add nothing: only its best alignments are of interest
+        if rec.split('\t').skip(12).any(|f| f == "tp:A:S") { continue; }
+        //rewrite the alignment type tag so the line reads as a secondary alignment
+        let mut out = String::with_capacity(rec.len() + 16);
+        let mut seen_tp = false;
+        for (i, f) in rec.split('\t').enumerate() {
+            if i > 0 { out.push('\t'); }
+            if i >= 12 && f.starts_with("tp:A:") {
+                out.push_str("tp:A:S");
+                seen_tp = true;
+            } else {
+                out.push_str(f);
+            }
+        }
+        //a PAF without tp tags (e.g. not from minimap2) still needs the line marked secondary
+        if !seen_tp { out.push_str("\ttp:A:S"); }
+
+        writeln!(writer, "{}{}\ths:A:P", out, hq_suffix)?;
+    }
+    Ok(())
+}
+
 //get chrom of alignment if mapped and non secondary
 fn paf_get_chrom(rec: &str) -> Option<&str> {
     let mut tname: Option<&str> = None;
@@ -186,8 +219,7 @@ pub fn process_paf(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let (asm1_out_path, asm2_out_path, span_path) =
         crate::output_paths(args, ".paf", ".txt");
 
-    //create output writer(s): a single merged file by default (out_asm2 = None), one per
-    //haplotype under -p
+    //create output writer(s): a single merged file by default, one per haplotype under -p
     let mut out_asm1 = BufWriter::new(File::create(&asm1_out_path)
         .map_err(|e| format!("Failed to create output file '{}': {}", asm1_out_path, e))?);
     let mut out_asm2: Option<BufWriter<File>> = match &asm2_out_path {
@@ -214,6 +246,8 @@ pub fn process_paf(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut count_asm2: u64 = 0;
     let mut count_equal: u64 = 0;
     let mut count_unmapped: u64 = 0;
+    //reads that also got their losing haplotype's alignments written under --keep-loser
+    let mut count_loser: u64 = 0;
 
     //initialize summed read lengths (bases) per category
     //read counts alone can mislead since short reads count the same as long ones
@@ -253,10 +287,13 @@ pub fn process_paf(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         //both clusters are the same read, so take the best informed of the two estimates
         let read_bases = cluster_qlen(&cluster_asm1).max(cluster_qlen(&cluster_asm2));
 
-        //get cluster with the higher alignment score, returns the Winner enum and HAPQ
-        let (winner, hapq) = compare_clusters(&cluster_asm1, &cluster_asm2, args, resolved_match_sc)?;
+        //get cluster with the higher alignment score, returns the Winner enum, HAPQ, and whether
+        //the losing cluster scored close enough to the winner to be worth keeping
+        let (winner, hapq, loser_close) = compare_clusters(&cluster_asm1, &cluster_asm2, args, resolved_match_sc)?;
+        //--keep-loser conflicts with -p, so out_asm2 is always None here and every losing record
+        //goes to out_asm1, the merged writer
+        let keep_loser = args.keep_loser && loser_close;
 
-       
         //format hq tag suffix if hapq mode is active
         let hq_suffix = match hapq {
             Some(hq) => format!("\thq:i:{}", hq),
@@ -270,6 +307,10 @@ pub fn process_paf(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 count_asm1 += 1; // increment read counter
                 bases_asm1 += read_bases;
                 write_paf_cluster(&mut out_asm1, &cluster_asm1, &hq_suffix, "\tHP:i:1", &mut span_writer, "asm1")?;
+                if keep_loser {
+                    count_loser += 1;
+                    write_loser_paf_cluster(&mut out_asm1, &cluster_asm2, &hq_suffix)?;
+                }
             }
             //asm2 clear winner, write to the asm2 output (or merged writer)
             crate::Winner::Asm2 => {
@@ -277,6 +318,10 @@ pub fn process_paf(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 bases_asm2 += read_bases;
                 let w2 = match out_asm2 { Some(ref mut w) => w, None => &mut out_asm1 };
                 write_paf_cluster(w2, &cluster_asm2, &hq_suffix, "\tHP:i:2", &mut span_writer, "asm2")?;
+                if keep_loser {
+                    count_loser += 1;
+                    write_loser_paf_cluster(&mut out_asm1, &cluster_asm1, &hq_suffix)?;
+                }
             }
             crate::Winner::Both => {
                 count_equal += 1; // increment read counter
@@ -295,10 +340,19 @@ pub fn process_paf(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     match crate::choose_random(qname.as_bytes()) {
                         crate::Winner::Asm1 => {
                             write_paf_cluster(&mut out_asm1, &cluster_asm1, &hq_suffix, "\tHP:i:1", &mut span_writer, "asm1")?;
+                            //the side the hash did not pick is the loser here
+                            if keep_loser {
+                                count_loser += 1;
+                                write_loser_paf_cluster(&mut out_asm1, &cluster_asm2, &hq_suffix)?;
+                            }
                         }
                         _ => {
                             let w2 = match out_asm2 { Some(ref mut w) => w, None => &mut out_asm1 };
                             write_paf_cluster(w2, &cluster_asm2, &hq_suffix, "\tHP:i:2", &mut span_writer, "asm2")?;
+                            if keep_loser {
+                                count_loser += 1;
+                                write_loser_paf_cluster(&mut out_asm1, &cluster_asm1, &hq_suffix)?;
+                            }
                         }
                     }
                 }
@@ -339,6 +393,10 @@ pub fn process_paf(args: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         [count_asm1, count_asm2, count_equal, count_unmapped],
         [bases_asm1, bases_asm2, bases_equal, bases_unmapped],
     );
+    //how many reads cleared --loser-frac is otherwise invisible
+    if args.keep_loser {
+        crate::print_loser_summary(count_loser, count_asm1 + count_asm2 + count_equal, args.loser_frac);
+    }
     Ok(())
 }
 
@@ -400,8 +458,6 @@ where
 
 
 //helper function to get the query length (PAF field 2) of a cluster of alignments
-//the field is present on unmapped (--paf-no-hit) lines too, so it works for every cluster
-//used for summary statistics only, so a malformed field contributes 0 rather than aborting the run
 fn cluster_qlen(cluster: &[String]) -> u64 {
     cluster.first()
         .and_then(|line| line.split('\t').nth(1))
@@ -482,12 +538,16 @@ pub fn get_weighted_score(cur_clust : &Vec<String>, tag_prefix: &str) -> Result<
 
 }
 
-pub fn compare_clusters<'a>(clust1:&'a Vec<String>, clust2:&'a Vec<String>, args: &Cli, match_sc: f32) ->  Result<(crate::Winner, Option<u8>), Box<dyn std::error::Error>> {
+//returns the winner, the HAPQ, and whether the losing cluster is close enough to the winner to
+//be worth writing under --keep-loser
+pub fn compare_clusters<'a>(clust1:&'a Vec<String>, clust2:&'a Vec<String>, args: &Cli, match_sc: f32) ->  Result<(crate::Winner, Option<u8>, bool), Box<dyn std::error::Error>> {
 
+    //the losing side of these cases holds nothing but an unmapped line, so there is never a
+    //losing alignment to keep: the trailing false turns --keep-loser off for all three
     match (clust1[0].split('\t').nth(5), clust2[0].split('\t').nth(5)) {
-        (Some("*"), Some("*")) => {return Ok((crate::Winner::Unmapped, None));}, // both reads unmapped
-        (Some("*"), _) => return Ok((crate::Winner::Asm2, if args.no_hapq { None } else { Some(60u8) })), // asm1 hap unmapped
-        (_, Some("*")) => return Ok((crate::Winner::Asm1, if args.no_hapq { None } else { Some(60u8) })), // asm2 hap unmapped
+        (Some("*"), Some("*")) => {return Ok((crate::Winner::Unmapped, None, false));}, // both reads unmapped
+        (Some("*"), _) => return Ok((crate::Winner::Asm2, if args.no_hapq { None } else { Some(60u8) }, false)), // asm1 hap unmapped
+        (_, Some("*")) => return Ok((crate::Winner::Asm1, if args.no_hapq { None } else { Some(60u8) }, false)), // asm2 hap unmapped
         _ => {} // continue if mapped to both haps
     }
 
@@ -500,12 +560,13 @@ pub fn compare_clusters<'a>(clust1:&'a Vec<String>, clust2:&'a Vec<String>, args
     //both is a special case that can be determined by user input
     if score1 > score2 {
         let hapq = if args.no_hapq { None } else { Some(crate::compute_hapq(score1, score2, n_splits1, match_sc)) };
-        Ok((crate::Winner::Asm1, hapq))
+        Ok((crate::Winner::Asm1, hapq, crate::loser_is_close(score1, score2, args.loser_frac)))
     } else if score1 < score2 {
         let hapq = if args.no_hapq { None } else { Some(crate::compute_hapq(score2, score1, n_splits2, match_sc)) };
-        Ok((crate::Winner::Asm2, hapq))
+        Ok((crate::Winner::Asm2, hapq, crate::loser_is_close(score2, score1, args.loser_frac)))
     } else {
         let hapq = if args.no_hapq { None } else { Some(0u8) };
-        Ok((crate::Winner::Both, hapq))
+        //a tie is the case where the second alignment is most worth seeing, so it always qualifies
+        Ok((crate::Winner::Both, hapq, true))
     }
 }

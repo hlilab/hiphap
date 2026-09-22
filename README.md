@@ -6,6 +6,26 @@ HipHap resolves this issue by aligning reads to each haplotype assembly separate
 HipHap is implemented in Rust, and supports SAM, BAM, CRAM, and PAF formats
 
 
+## Table of Contents
+
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Threads](#threads)
+- [Example Workflow](#example-workflow)
+  - [Diploid assembly alignment](#diploid-assembly-alignment)
+  - [One file per haplotype (`-p`)](#one-file-per-haplotype--p)
+  - [Comparing different reference genomes](#comparing-different-reference-genomes)
+  - [CRAM input files](#cram-input-files)
+- [Example PAF Usage](#example-paf-usage)
+- [Weighted Alignment Scoring Mechanism](#weighted-alignment-scoring-mechanism)
+- [Haplotype tag (HP)](#haplotype-tag-hp)
+- [Losing-haplotype alignments (`--keep-loser`)](#losing-haplotype-alignments---keep-loser)
+  - [Score threshold (`--loser-frac`)](#score-threshold---loser-frac)
+  - [PAF](#paf)
+- [Haplotype Assignment Quality (HapQ)](#haplotype-assignment-quality-hapq)
+- [Citation](#citation)
+
+
 ## Installation
 
 Recommended: Download precompiled binary:
@@ -24,7 +44,7 @@ cargo build --release
 ## Usage
 
 ```
-HipHap: Choose the best alignment to each haploid of a diploid assembly
+HipHap: Choose the best alignment of a read to each haploid of a diploid assembly
 
 Usage: hiphap [OPTIONS] <ASM1> <ASM2>
 
@@ -33,23 +53,23 @@ Arguments:
   <ASM2>  asm2 alignment file (sam/bam/cram/paf)
 
 Options:
-  -1, --s1 <NAME>           label for asm1 sample (used in output file names and summary) [default: asm1]
-  -2, --s2 <NAME>           label for asm2 sample (used in output file names and summary) [default: asm2]
+  -1, --s1 <NAME>           label for asm1 sample (used in output names) [default: asm1]
+  -2, --s2 <NAME>           label for asm2 sample (used in output names) [default: asm2]
       --paf                 input files are PAF
       --ms                  use ms:i: tag rather than AS:i: for alignment score
-  -b, --both                write reads with equal alignment scores to both output files (requires -p)
   -p, --partition           write one file per haplotype instead of a single merged output file
+  -b, --both                write reads with equal alignment scores to both output files (requires -p)
   -k, --keep-loser          also write each read's best alignment to the losing haplotype as a secondary record, tagged hs:A: (merged output only)
-      --loser-frac <FLOAT>  with --keep-loser, only write the losing alignment when its weighted score is at least this fraction of the winner's [default: 0.8]
-  -o, --output <FILE>       output file [default: hiphap_{s1}_{s2}_merged.*]; with -p this is the stem for {out}_{s1}.* and {out}_{s2}.*
+      --loser-frac <FLOAT>  score floor for AS score fraction in --keep-loser [default: 0.8]
+  -o, --output <FILE>       output file name [default: hiphap_{s1}_{s2}_merged.*]
   -u, --unmapped <DEST>     where to write reads unmapped in both assemblies: asm1, asm2, or discard [default: asm1] [possible values: asm1, asm2, discard]
-      --ref-merged <FILE>   combined reference FASTA for merged CRAM output (must contain all contigs of both inputs); required for merged CRAM output
+      --ref-merged <FILE>   combined reference FASTA for merged CRAM output; required for merged CRAM output
       --ref1 <FILE>         reference FASTA for cram file (asm1)
       --ref2 <FILE>         reference FASTA for cram file (asm2)
-  -A, --match-sc <FLOAT>    per-base match score from aligner scoring scheme (auto-estimated from ms:i tags if omitted)
+  -A, --match-sc <FLOAT>    per-base match score from aligner scoring scheme (auto-estimated if omitted)
       --no-hapq             skip HAPQ score calculation and hq tag output (e.g. for comparing GRCh38 vs CHM13)
       --no-span-chrom       disable writing the chromosome-spanning reads file (*_span_chrom.fastq, or .txt for PAF)
-  -t, --threads <INT>       total thread pool size [default: 6; 8 with -p]. For BAM/CRAM output the writer gets 4x a reader when merging and 3x with -p; 1x for SAM
+  -t, --threads <INT>       number of threads[default: 6; 8 with -p]
   -h, --help                Print help
   -V, --version             Print version
 ```

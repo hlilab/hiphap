@@ -12,19 +12,13 @@ HipHap is implemented in Rust, and supports SAM, BAM, CRAM, and PAF formats
 
 - [Installation](#installation)
 - [Usage](#usage)
-  - [Threads](#threads)
 - [Example Workflow](#example-workflow)
-  - [Diploid assembly alignment](#diploid-assembly-alignment)
-  - [One file per haplotype (`-p`)](#one-file-per-haplotype--p)
-  - [Comparing different reference genomes](#comparing-different-reference-genomes)
+  - [Partitioned mode: Separate output file per haplotype (`-p`)](#partitioned-mode-separate-output-file-per-haplotype--p)
   - [CRAM input files](#cram-input-files)
+  - [Comparing different reference genomes](#comparing-different-reference-genomes)
 - [Example PAF Usage](#example-paf-usage)
-- [Weighted Alignment Scoring Mechanism](#weighted-alignment-scoring-mechanism)
-- [Haplotype tag (HP)](#haplotype-tag-hp)
 - [Losing-haplotype alignments (`--keep-loser`)](#losing-haplotype-alignments---keep-loser)
-  - [Score threshold (`--loser-frac`)](#score-threshold---loser-frac)
   - [PAF](#paf)
-- [Haplotype Assignment Quality (HapQ)](#haplotype-assignment-quality-hapq)
 - [Citation](#citation)
 
 
@@ -76,7 +70,7 @@ Options:
   -V, --version             Print version
 ```
 
-Each output record is annotated with two tags: an `HP:i:` tag carrying the haplotype it was assigned to (`1` = asm1, `2` = asm2), and an `hq:i:` tag carrying the HapQ score, unless `--no-hapq` is set. See [Haplotype tag (HP)](#haplotype-tag-hp).
+Each output record is annotated with two tags: an `HP:i:` tag carrying the haplotype it was assigned to (`1` = asm1, `2` = asm2), and an `hq:i:` tag carrying the HapQ score, unless `--no-hapq` is set.
 
 The `--keep-loser` flag can be set to also write the read's alignment to the *losing* haplotype, flagged secondary and marked with an `hs:A:` tag — see [Losing-haplotype alignments](#losing-haplotype-alignments---keep-loser).
 
@@ -85,9 +79,7 @@ The per-base match score used by the HAPQ calculation is auto-estimated from the
 
 ## Example Workflow
 
-HipHap reads the two inputs as parallel streams and clusters  records by read, so **both files must have the reads in the same order**. Default [minimap2](https://github.com/lh3/minimap2) output satisfies this, as does name-sorting both files. Coordinate-sorted input files will fail. 
-
-### Diploid assembly alignment
+HipHap reads the two inputs as parallel streams and clusters records by read, so **both files must have the reads in the same order**. Default [minimap2](https://github.com/lh3/minimap2) output satisfies this, as does name-sorting both files. Coordinate-sorted input files will fail. 
 
 ```bash
 # If needed, split diploid genome assembly FASTA into respective haplotypes
@@ -109,7 +101,7 @@ samtools sort -@ 12 -o sample_sorted.bam sample.sam
 By default HipHap writes a **single merged output file** with a merged header, so no separate `samtools merge` step is needed. Each record carries an `HP:i:1`/`HP:i:2` tag naming the haplotype it was assigned to. 
 
 
-HipHap also writes `hiphap_{s1}_{s2}_span_chrom.fastq`, a FASTQ of reads whose alignments span more than one chromosome. These reads are emitted for easy realignment. Pass `--no-span-chrom` to skip writing this file. If inputs are PAF files, a tsv of the chromosome spannign reads rather than a fastq is output, as the read sequences are not stored in the input PAF files. When `-o` is given, this file mimics the naming (`sample_span_chrom.fastq` above) so it lands beside the alignment output.
+HipHap also writes `hiphap_{s1}_{s2}_span_chrom.fastq`, a FASTQ of reads whose alignments span more than one chromosome. These reads are emitted for easy realignment. Pass `--no-span-chrom` to skip writing this file. If inputs are PAF files, a tsv of the chromosome spanning reads rather than a fastq is output, as the read sequences are not stored in the input PAF files. When `-o` is given, this file mimics the naming (`sample_span_chrom.fastq` above) so it lands beside the alignment output.
 
 #### Notes:
 - Merged output requires the two assemblies to have **unique contig names**. The merged header concatenates the two inputs `@SQ` lists, so any contig name shared between them is ambiguous; pass `-p` for such inputs.
@@ -163,7 +155,28 @@ hiphap --no-hapq -p -1 grch38 -2 chm13 grch38_alignments.sam chm13_alignments.sa
 # Output: hiphap_grch38.sam  hiphap_chm13.sam
 ```
 
-### Losing-haplotype alignments (`--keep-loser`)
+## Example PAF Usage
+
+ #### Notes: 
+- It is important to use the `--paf-no-hit` flags when aligning with minimap2 to output unmapped reads to the file
+- If a SAM file is converted to a PAF file with `paftools.js sam2paf`, it will **NOT** have the required AS:i: tag and HipHap will fail to run
+
+```bash
+minimap2 -cx map-hifi --paf-no-hit -o asm1_alignments.paf hg002v1.1.MATERNAL.fa reads.fastq
+minimap2 -cx map-hifi --paf-no-hit -o asm2_alignments.paf hg002v1.1.PATERNAL.fa reads.fastq
+
+hiphap --paf asm1_alignments.paf asm2_alignments.paf
+# Output: hiphap_asm1_asm2_merged.paf  hiphap_asm1_asm2_span_chrom.txt
+```
+
+`-p` also works with PAF
+
+```bash
+hiphap --paf -p asm1_alignments.paf asm2_alignments.paf
+# Output: hiphap_asm1.paf  hiphap_asm2.paf  hiphap_asm1_asm2_span_chrom.txt
+```
+
+## Losing-haplotype alignments (`--keep-loser`)
 
 By default only the winning haplotype's alignments are written and the losing haplotype's are discarded. When the two haplotypes scored close to each other, the discarded alignment may also be of interest, so `--keep-loser`  writes it:
 
@@ -189,7 +202,7 @@ For each read, the losing haplotype's **primary and supplementary** alignments a
 
 ```bash
 samtools view -d hs   merged.bam    # every losing-haplotype record
-samtools view -d hs:P merged.bam    # Primary alignment to the losing haplotype, one per read
+samtools view -d hs:P merged.bam    # primary alignment to the losing haplotype, one per read
 samtools view -d hs:S merged.bam    # the losing cluster's split segments
 samtools view -e '![hs]' merged.bam # winners only — the file hiphap writes without the --keep-loser flag
 ```
@@ -208,27 +221,6 @@ Details:
 `--keep-loser` works for merged PAF output too. Losing lines get their `tp:A:P` rewritten to `tp:A:S` and the `hq:i:`/`hs:A:` tags appended, and lines already marked `tp:A:S` or with a `*` target are dropped.
 
 In PAF `hs` is always `P`: minimap2 gives every non-secondary chain `tp:A:P`, including the ones that become supplementary in SAM, so a PAF line carries nothing that separates the two. `hs:A:S` only ever appears in SAM/BAM/CRAM output.
-
-## Example PAF Usage
-
- #### Notes: 
-- It is important to use the `--paf-no-hit` flags when aligning with minimap2 to output unmapped reads to the file
-- If a SAM file is converted to a PAF file with `paftools.js sam2paf`, it will **NOT** have the required AS:i: tag and HipHap will fail to run
-
-```bash
-minimap2 -cx map-hifi --paf-no-hit -o asm1_alignments.paf hg002v1.1.MATERNAL.fa reads.fastq
-minimap2 -cx map-hifi --paf-no-hit -o asm2_alignments.paf hg002v1.1.PATERNAL.fa reads.fastq
-
-hiphap --paf asm1_alignments.paf asm2_alignments.paf
-# Output: hiphap_asm1_asm2_merged.paf  hiphap_asm1_asm2_span_chrom.txt
-```
-
-`-p` also works with PAF
-
-```bash
-hiphap --paf -p asm1_alignments.paf asm2_alignments.paf
-# Output: hiphap_asm1.paf  hiphap_asm2.paf  hiphap_asm1_asm2_span_chrom.txt
-```
 
 ## Citation
 If HipHap has helped you in your research, please cite our preprint at: TODO

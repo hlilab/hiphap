@@ -23,18 +23,30 @@ HipHap resolves this issue by aligning reads to each haplotype assembly separate
 
 ## Installation
 
-Recommended: Download precompiled binary:
-```bash
-# Todo
-```
+### Download precompiled binary:
+Prebuilt binaries can be downloaded from the [Releases](https://github.com/jheinz27/hiphap/releases) page.
 
-Build from source:
+```bash
+wget https://github.com/jheinz27/hiphap/releases/download/v0.1.0/hiphap-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+tar -xvzf hiphap-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+hiphap-v0.1.0-x86_64-unknown-linux-musl/hiphap --help
+``` 
+
+### Build from source:
 ```bash
 git clone https://github.com/jheinz27/hiphap.git
 cd hiphap
 cargo build --release
 ./target/release/hiphap --help
 ```
+#### Dependencies 
+- Rust programming language >= v1.70
+- clap = "4.0"
+- rust-htslib = "0.46.0"
+- twox-hash = "1.6"
+- flate2 = "1"
+- rand = "0.8"
+ 
 
 ## Usage
 

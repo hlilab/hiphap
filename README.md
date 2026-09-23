@@ -23,7 +23,7 @@ HipHap resolves this issue by aligning reads to each haplotype assembly separate
 
 ## Installation
 
-### Download precompiled binary:
+### RECOMMENDED: Download precompiled binary:
 Prebuilt binaries can be downloaded from the [Releases](https://github.com/jheinz27/hiphap/releases) page.
 
 ```bash

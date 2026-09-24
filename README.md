@@ -39,13 +39,20 @@ cd hiphap
 cargo build --release
 ./target/release/hiphap --help
 ```
+
+If Rust is not already installed, install it with [rustup](https://rustup.rs/). This installs the Rust compiler (`rustc`), Cargo package manager (`cargo`), and the `rustup` toolchain manager:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+``` 
 #### Dependencies 
-- Rust programming language >= v1.70
-- clap = "4.0"
-- rust-htslib = "0.46.0"
-- twox-hash = "1.6"
-- flate2 = "1"
-- rand = "0.8"
+- `Rust >= 1.70`, including Cargo
+- The following Rust crate dependencies are installed automatically by Cargo during the build:
+  - `clap = "4.0"`
+  - `rust-htslib = "0.46.0"`
+  - `twox-hash = "1.6"`
+  - `flate2 = "1"`
+  - `rand = "0.8"`
  
 
 ## Usage
